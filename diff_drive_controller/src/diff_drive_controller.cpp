@@ -101,16 +101,41 @@ controller_interface::return_type DiffDriveController::update_reference_from_sub
   const rclcpp::Time & time, const rclcpp::Duration & /*period*/)
 {
   auto logger = get_node()->get_logger();
+  {
+    static rclcpp::Clock c(RCL_STEADY_TIME);
+    RCLCPP_DEBUG_THROTTLE(logger, c, 1000,
+      "[PERSIUS A] update_reference ENTERED | sub_active=%d | topic='%s' | "
+      "publishers_on_topic=%zu | callback_fires_total=%lu",
+      static_cast<int>(subscriber_is_active_),
+      velocity_command_subscriber_ ? velocity_command_subscriber_->get_topic_name() : "<null>",
+      velocity_command_subscriber_ ? get_node()->count_publishers(
+          velocity_command_subscriber_->get_topic_name()) : 0UL,
+      persius_cb_count_);
+  }
 
   const std::shared_ptr<TwistStamped> command_msg_ptr = *(received_velocity_msg_ptr_.readFromRT());
 
   if (command_msg_ptr == nullptr)
   {
-    RCLCPP_WARN(logger, "Velocity message received was a nullptr.");
+    static rclcpp::Clock c(RCL_STEADY_TIME);
+    RCLCPP_DEBUG_THROTTLE(logger, c, 1000,
+      "[PERSIUS B] EARLY RETURN: command_msg_ptr is nullptr (no cmd_vel ever received)");
     return controller_interface::return_type::ERROR;
   }
 
   const auto age_of_last_command = time - command_msg_ptr->header.stamp;
+  // PERSIUS DEBUG (#300): this timeout branch zeroes the command and logs
+  // NOTHING upstream -- the NaN branch below DOES log. That asymmetry made the
+  // controller silent during the 2026-08-07 investigation.
+  {
+    static rclcpp::Clock dbgclk(RCL_STEADY_TIME);
+    RCLCPP_DEBUG_THROTTLE(
+      logger, dbgclk, 1000,
+      "[PERSIUS L113] age=%.1fms timeout=%.1fms in.x=%.4f -> %s",
+      age_of_last_command.seconds() * 1000.0, cmd_vel_timeout_.seconds() * 1000.0,
+      command_msg_ptr->twist.linear.x,
+      (age_of_last_command > cmd_vel_timeout_) ? "STALE->ZERO" : "accept");
+  }
   // Brake if cmd_vel has timeout, override the stored command
   if (age_of_last_command > cmd_vel_timeout_)
   {
@@ -131,6 +156,11 @@ controller_interface::return_type DiffDriveController::update_reference_from_sub
       "Command message contains NaNs. Not updating reference interfaces.");
   }
 
+  {
+    static rclcpp::Clock c(RCL_STEADY_TIME);
+    RCLCPP_DEBUG_THROTTLE(logger, c, 1000,
+      "[PERSIUS C] refs now: [0]=%.4f [1]=%.4f", reference_interfaces_[0], reference_interfaces_[1]);
+  }
   previous_update_timestamp_ = time;
 
   return controller_interface::return_type::OK;
@@ -140,6 +170,10 @@ controller_interface::return_type DiffDriveController::update_and_write_commands
   const rclcpp::Time & time, const rclcpp::Duration & period)
 {
   auto logger = get_node()->get_logger();
+  {
+    static rclcpp::Clock c(RCL_STEADY_TIME);
+    RCLCPP_DEBUG_THROTTLE(logger, c, 1000, "[PERSIUS D] update_and_write_commands ENTERED");
+  }
 
   // command may be limited further by SpeedLimit,
   // without affecting the stored twist command
@@ -148,8 +182,17 @@ controller_interface::return_type DiffDriveController::update_and_write_commands
 
   if (!std::isfinite(linear_command) || !std::isfinite(angular_command))
   {
+    static rclcpp::Clock dbgclk(RCL_STEADY_TIME);
+    RCLCPP_DEBUG_THROTTLE(logger, dbgclk, 1000,
+      "[PERSIUS L148] EARLY RETURN: reference NOT finite (lin=%f ang=%f)",
+      linear_command, angular_command);
     // NaNs occur on initialization when the reference interfaces are not yet set
     return controller_interface::return_type::OK;
+  }
+  {
+    static rclcpp::Clock dbgclk(RCL_STEADY_TIME);
+    RCLCPP_DEBUG_THROTTLE(logger, dbgclk, 1000,
+      "[PERSIUS L146] refs finite: lin=%.4f ang=%.4f", linear_command, angular_command);
   }
 
   // Apply (possibly new) multipliers:
@@ -262,6 +305,11 @@ controller_interface::return_type DiffDriveController::update_and_write_commands
   double & last_angular = previous_two_commands_.back()[1];
   double & second_to_last_angular = previous_two_commands_.front()[1];
 
+  {
+    static rclcpp::Clock c(RCL_STEADY_TIME);
+    RCLCPP_DEBUG_THROTTLE(logger, c, 1000,
+      "[PERSIUS E] pre-limiter lin=%.4f ang=%.4f", linear_command, angular_command);
+  }
   limiter_linear_->limit(linear_command, last_linear, second_to_last_linear, period.seconds());
   limiter_angular_->limit(angular_command, last_angular, second_to_last_angular, period.seconds());
   previous_two_commands_.pop();
@@ -287,6 +335,13 @@ controller_interface::return_type DiffDriveController::update_and_write_commands
   const double velocity_right =
     (linear_command + angular_command * wheel_separation / 2.0) / right_wheel_radius;
 
+  {
+    static rclcpp::Clock dbgclk(RCL_STEADY_TIME);
+    RCLCPP_DEBUG_THROTTLE(logger, dbgclk, 1000,
+      "[PERSIUS L285] wheel cmds: L=%.4f R=%.4f rad/s (post-limiter lin=%.4f)",
+      velocity_left, velocity_right, linear_command);
+  }
+
   // Set wheels velocities:
   bool set_command_result = true;
   for (size_t index = 0; index < static_cast<size_t>(wheels_per_side_); ++index)
@@ -299,13 +354,23 @@ controller_interface::return_type DiffDriveController::update_and_write_commands
 
   RCLCPP_DEBUG_EXPRESSION(
     logger, !set_command_result, "Unable to set the command to one of the command handles!");
+  {
+    static rclcpp::Clock c(RCL_STEADY_TIME);
+    RCLCPP_DEBUG_THROTTLE(logger, c, 1000,
+      "[PERSIUS F] set_value result=%d", static_cast<int>(set_command_result));
+  }
 
   return controller_interface::return_type::OK;
 }
 
+// [PERSIUS] Full lifecycle + dataflow instrumentation (#300).
+// Every transition and every state variable the cmd_vel chain depends on is
+// logged, so a break shows as a GAP between two points rather than requiring
+// inference. Added after cmd_vel was found never to have worked post-Jazzy.
 controller_interface::CallbackReturn DiffDriveController::on_configure(
   const rclcpp_lifecycle::State &)
 {
+  RCLCPP_DEBUG(get_node()->get_logger(), "[PERSIUS K] on_configure ENTERED");
   auto logger = get_node()->get_logger();
 
   // update parameters if they have changed
@@ -428,10 +493,23 @@ controller_interface::CallbackReturn DiffDriveController::on_configure(
   }
 
   // initialize command subscriber
+  RCLCPP_DEBUG(logger,
+    "[PERSIUS I] creating cmd_vel subscription: topic='%s' node='%s' ns='%s' "
+    "QoS=SystemDefaultsQoS(RELIABLE)",
+    DEFAULT_COMMAND_TOPIC, get_node()->get_name(), get_node()->get_namespace());
+
   velocity_command_subscriber_ = get_node()->create_subscription<TwistStamped>(
     DEFAULT_COMMAND_TOPIC, rclcpp::SystemDefaultsQoS(),
     [this](const std::shared_ptr<TwistStamped> msg) -> void
     {
+      ++persius_cb_count_;   // counted even when the throttled log is silent
+      {
+        static rclcpp::Clock c(RCL_STEADY_TIME);
+        RCLCPP_DEBUG_THROTTLE(get_node()->get_logger(), c, 1000,
+          "[PERSIUS G] CALLBACK FIRED #%lu: x=%.4f stamp=%d.%09u",
+          persius_cb_count_, msg->twist.linear.x,
+          msg->header.stamp.sec, msg->header.stamp.nanosec);
+      }
       if (!subscriber_is_active_)
       {
         RCLCPP_WARN(get_node()->get_logger(), "Can't accept new commands. subscriber is inactive");
@@ -452,7 +530,12 @@ controller_interface::CallbackReturn DiffDriveController::on_configure(
         cmd_vel_timeout_ == rclcpp::Duration::from_seconds(0.0) ||
         current_time_diff < cmd_vel_timeout_)
       {
-        received_velocity_msg_ptr_.writeFromNonRT(msg);
+        {
+        static rclcpp::Clock c(RCL_STEADY_TIME);
+        RCLCPP_DEBUG_THROTTLE(get_node()->get_logger(), c, 1000,
+          "[PERSIUS H] STORED into realtime buffer: x=%.4f", msg->twist.linear.x);
+      }
+      received_velocity_msg_ptr_.writeFromNonRT(msg);
       }
       else
       {
@@ -533,6 +616,10 @@ controller_interface::CallbackReturn DiffDriveController::on_configure(
   odometry_transform_message.transforms.front().header.frame_id = odom_frame_id;
   odometry_transform_message.transforms.front().child_frame_id = base_frame_id;
 
+  RCLCPP_DEBUG(logger,
+    "[PERSIUS J] subscription RESOLVED to '%s'",
+    velocity_command_subscriber_ ? velocity_command_subscriber_->get_topic_name() : "<null>");
+
   previous_update_timestamp_ = get_node()->get_clock()->now();
   return controller_interface::CallbackReturn::SUCCESS;
 }
@@ -540,6 +627,7 @@ controller_interface::CallbackReturn DiffDriveController::on_configure(
 controller_interface::CallbackReturn DiffDriveController::on_activate(
   const rclcpp_lifecycle::State &)
 {
+  RCLCPP_DEBUG(get_node()->get_logger(), "[PERSIUS M] on_activate ENTERED");
   const auto left_result =
     configure_side("left", params_.left_wheel_names, registered_left_wheel_handles_);
   const auto right_result =
@@ -561,6 +649,8 @@ controller_interface::CallbackReturn DiffDriveController::on_activate(
   }
 
   subscriber_is_active_ = true;
+  RCLCPP_DEBUG(get_node()->get_logger(),
+    "[PERSIUS L] subscriber_is_active_ = TRUE (callback will now accept messages)");
 
   RCLCPP_DEBUG(get_node()->get_logger(), "Subscriber and publisher are now active.");
   return controller_interface::CallbackReturn::SUCCESS;

@@ -122,6 +122,12 @@ protected:
   bool subscriber_is_active_ = false;
   rclcpp::Subscription<TwistStamped>::SharedPtr velocity_command_subscriber_ = nullptr;
 
+  /// [PERSIUS #300] Total subscription-callback invocations. Counted on EVERY
+  /// call (the log line is throttled, this is not) so the update loop can report
+  /// whether the callback has EVER fired. A gap between "messages published" and
+  /// this staying 0 localises the break to DDS delivery / executor dispatch.
+  unsigned long persius_cb_count_ = 0;
+
   realtime_tools::RealtimeBuffer<std::shared_ptr<TwistStamped>> received_velocity_msg_ptr_{nullptr};
 
   std::queue<std::array<double, 2>> previous_two_commands_;
