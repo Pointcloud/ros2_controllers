@@ -195,6 +195,30 @@ controller_interface::return_type DiffDriveController::update_and_write_commands
       "[PERSIUS L146] refs finite: lin=%.4f ang=%.4f", linear_command, angular_command);
   }
 
+  // PERSIUS (2026-11-09, pointcloud/persius #372): pick up parameter changes WHILE RUNNING.
+  // Upstream refreshes params_ only in on_configure(), so a `set_parameters` call changed
+  // nothing the odometry or the wheel commands used until the controller was cycled
+  // (which resets the odometry pose). The wheel-scale autocalibrators apply a learned
+  // wheel_separation_multiplier / left+right_wheel_radius_multiplier live with one
+  // set_parameters call, so the refresh belongs here. is_old() is a cheap atomic check on
+  // every cycle; get_params() locks only when something actually changed. The odometry gets
+  // the new wheel geometry from the next cycle on and keeps integrating from its current
+  // pose (setWheelParams only assigns three doubles; no reset).
+  if (param_listener_->is_old(params_))
+  {
+    params_ = param_listener_->get_params();
+    odometry_.setWheelParams(
+      params_.wheel_separation_multiplier * params_.wheel_separation,
+      params_.left_wheel_radius_multiplier * params_.wheel_radius,
+      params_.right_wheel_radius_multiplier * params_.wheel_radius);
+    RCLCPP_INFO(
+      logger,
+      "Parameters updated while running: wheel_separation_multiplier=%.6f, "
+      "wheel_radius_multiplier left=%.6f right=%.6f (odometry geometry refreshed, pose kept)",
+      params_.wheel_separation_multiplier, params_.left_wheel_radius_multiplier,
+      params_.right_wheel_radius_multiplier);
+  }
+
   // Apply (possibly new) multipliers:
   const double wheel_separation = params_.wheel_separation_multiplier * params_.wheel_separation;
   const double left_wheel_radius = params_.left_wheel_radius_multiplier * params_.wheel_radius;
